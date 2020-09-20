@@ -4,6 +4,7 @@ import sys
 
 import models
 
+
 # Parameter defaults.
 DEFAULTS = {
     "data_dir": ".",
@@ -43,3 +44,10 @@ DEFAULTS = {
 EPCS_MAX = 10_000
 # Whether to execute synchronously or in parallel.
 SYNC = False
+# Features to store as extra data for each sample.
+MATHIS_MODEL_FET = "mathis model label-ewma-alpha0.01"
+RTT_ESTIMATE_FET = "RTT estimate us-ewma-alpha0.01"
+ARRIVAL_TIME_FET = "arrival time us"
+THR_ESTIMATE_FET = "throughput p/s-ewma-alpha0.007"
+EXTRA_FETS = [ARRIVAL_TIME_FET, MATHIS_MODEL_FET,
+              RTT_ESTIMATE_FET, THR_ESTIMATE_FET]

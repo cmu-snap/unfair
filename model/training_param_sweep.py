@@ -366,11 +366,10 @@ def main():
         # Unpack the data.
         dat_all, sims = zip(*dat_all)
         dat_all = [utils.load_tmp_file(flp) for flp in dat_all]
-        dat_in, dat_out, dat_out_raw, dat_out_oracle, scl_grps = zip(*dat_all)
+        dat_in, dat_out, dat_extra, scl_grps = zip(*dat_all)
         dat_in = list(dat_in)
         dat_out = list(dat_out)
-        dat_out_raw = list(dat_out_raw)
-        dat_out_oracle = list(dat_out_oracle)
+        dat_extra = list(dat_extra)
         scl_grps = list(scl_grps)
 
         # Generate temporary data.
@@ -378,8 +377,7 @@ def main():
             # Select the data corresponding to this number of
             # simulations and percent of each simulation.
             dat_all = list(zip(*utils.filt(
-                dat_in, dat_out, dat_out_raw, dat_out_oracle, scl_grps,
-                num_sims, prc)))
+                dat_in, dat_out, dat_extra, scl_grps, num_sims, prc)))
             # Finish processesing the data and save it in a form that
             # can be read by the training process.
             ignore = train.gen_data(

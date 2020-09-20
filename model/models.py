@@ -6,7 +6,6 @@ import math
 import os
 from os import path
 import random
-from statistics import mean
 
 from matplotlib import pyplot
 import numpy as np
@@ -16,7 +15,12 @@ from sklearn import linear_model
 from sklearn import svm
 import torch
 
+import defaults
+import utils
+
+
 SMOOTHING_THRESHOLD = 0.4
+SLIDING_WINDOW_NUM_RTT = 1
 
 
 class PytorchModelWrapper:
@@ -77,8 +81,9 @@ class PytorchModelWrapper:
     def check_output(self, out, target):
         """
         Returns the number of examples from out that were classified correctly,
-        according to target.
+        according to target. out and target must be Torch tensors.
         """
+        utils.assert_tensor(out=out, target=target)
         size_out = out.size()
         size_target = target.size()
         assert size_target
@@ -96,7 +101,10 @@ class PytorchModelWrapper:
         return out.eq(target).type(torch.int).sum().item()
 
     def _check_output_helper(self, out):
-        """ Convert the raw network output into classes. """
+        """
+        Convert the raw network output into classes. out must be a torch Tensor.
+        """
+        utils.assert_tensor(out=out)
         # Assume a one-hot encoding of class probabilities. The class
         # is the index of the output entry with greatest value (i.e.,
         # highest probability). Set dim=1 because the first dimension
@@ -125,19 +133,14 @@ class BinaryModelWrapper(PytorchModelWrapper):
         self.win = win
         self.rtt_buckets = rtt_buckets
         self.windows = windows
-        if self.rtt_buckets or self.windows:
-            assert "arrival time us" in self.in_spc, \
-                ("When bucketizing packets, \"arrival time us\" must be a "
-                 "feature.")
         # Determine layer dimensions. If we are bucketizing packets
         # based on arrival time, then there will be one input feature
         # for every bucket (self.win) plus one input feature for every
-        # entry in self.in_spc *except* for "arrival time us". If we are
-        # not bucketizing packets, then there will be one input
-        # feature for each entry in self.in_spc for each packet
-        # (self.win).
+        # entry in self.in_spc. If we are not bucketizing packets,
+        # then there will be one input feature for each entry in
+        # self.in_spc for each packet (self.win).
         self.num_ins = (
-            self.win + len(self.in_spc) - 1 if self.rtt_buckets else (
+            self.win + len(self.in_spc) if self.rtt_buckets else (
                 len(self.in_spc) * self.win if self.windows else
                 len(self.in_spc)))
 
@@ -161,28 +164,20 @@ class BinaryModelWrapper(PytorchModelWrapper):
         return clss_str
 
     @staticmethod
-    def __bucketize(dat_in, dat_in_start_idx, dat_in_end_idx, dat_in_new,
-                    dat_in_new_idx, dur_us, num_buckets):
+    def __bucketize(dat_in, dat_extra, dat_in_start_idx, dat_in_end_idx,
+                    dat_in_new, dat_in_new_idx, dur_us, num_buckets):
         """
-        Uses dat_in["arrival time us"] to divide the arriving packets from
+        Uses dat_extra["arrival time us"] to divide the arriving packets from
         the range [dat_in_start_idx, dat_in_end_idx] into num_buckets
         intervals. Each interval has duration dur_us / num_buckets.
         Stores the resulting histogram in dat_in_new, at the row
-        indicated by dat_in_new_idx. Also updates dat_in_new with the
-        values of the other (i.e., non-bucket) features. Returns
-        nothing.
+        indicated by dat_in_new_idx. Returns nothing.
         """
-        fets = dat_in.dtype.names
-        assert "arrival time us" in fets, f"Missing \"arrival time us\": {fets}"
-        arr_times = dat_in[
+        arr_times = dat_extra[
             "arrival time us"][dat_in_start_idx:dat_in_end_idx + 1]
         num_pkts = arr_times.shape[0]
         assert num_pkts > 0, "Need more than 0 packets!"
 
-        # We are turning the arrival times into buckets, but there are
-        # other features that must be preserved.
-        other_fets = [col for col in dat_in.dtype.descr
-                      if col[0] != "arrival time us" and col[0] != ""]
         # The duration of each interval.
         interval_us = dur_us / num_buckets
         # The arrival time of the first packet, and therefore the
@@ -201,7 +196,7 @@ class BinaryModelWrapper(PytorchModelWrapper):
             dat_in_new[dat_in_new_idx][interval_idx] += 1
         # Set the values of the other features based on the last packet in this
         # window.
-        for fet, _ in other_fets:
+        for fet in dat_in.dtype.names:
             dat_in_new[fet][dat_in_new_idx] = dat_in[fet][dat_in_end_idx]
 
         # Check that the bucket features reflect all of the packets.
@@ -210,8 +205,7 @@ class BinaryModelWrapper(PytorchModelWrapper):
             (f"Error building counts! Bucketed {bucketed_pkts} of {num_pkts} "
              "packets!")
 
-    def __create_buckets(self, sim, dat_in, dat_out, dat_out_raw,
-                         dat_out_oracle, sequential):
+    def __create_buckets(self, sim, dat_in, dat_out, dat_extra, sequential):
         """
         Divides dat_in into windows and divides each window into self.win
         buckets, which each defines a temporal interval. The value of
@@ -220,10 +214,6 @@ class BinaryModelWrapper(PytorchModelWrapper):
         the last packet in the window.
         """
         print("Creating arrival time buckets...")
-        fets = dat_in.dtype.names
-        assert "arrival time us" in fets, f"Missing \"arrival time us\": {fets}"
-        arr_times = dat_in["arrival time us"]
-
         # 100x the min RTT (as determined by the simulation parameters).
         dur_us = 100 * 2 * (sim.edge_delays[0] * 2 + sim.btl_delay_us)
         # Determine the safe starting index. Do not pick indices
@@ -231,7 +221,7 @@ class BinaryModelWrapper(PytorchModelWrapper):
         # on the chosen index fit within the simulation.
         first_arr_time = None
         start_idx = None
-        for idx, arr_time in enumerate(arr_times):
+        for idx, arr_time in enumerate(dat_extra[defaults.ARRIVAL_TIME_FET]):
             if first_arr_time is None:
                 first_arr_time = arr_time
                 continue
@@ -258,23 +248,24 @@ class BinaryModelWrapper(PytorchModelWrapper):
         # Records the number of packets that arrived during each
         # interval. This is a structured numpy array where each column
         # is named based on its bucket index. We add extra columns for
-        # the non--arrival time features.
+        # the normal time features.
         dat_in_new = np.zeros(
             (num_wins,),
             dtype=([(f"bucket_{bkt}", "float") for bkt in range(self.win)] +
-                   [col for col in dat_in.dtype.descr
-                    if col[0] != "arrival time us" and col[0] != ""]))
+                   [col for col in dat_in.dtype.descr if col[0] != ""]))
 
         for win_idx, pkt_idx in enumerate(pkt_idxs):
             # Find the first packet in this window (whose index will
             # be win_start_idx).
-            cur_arr_time = arr_times[pkt_idx]
+            cur_arr_time = dat_extra[defaults.ARRIVAL_TIME_FET][pkt_idx]
             win_start_idx = None
             # Move backwards from the last packet in the window until
             # we find a packet whose arrival time is more that dur_us
             # in the past.
             for arr_time_idx in range(pkt_idx, -1, -1):
-                if cur_arr_time - arr_times[arr_time_idx] > dur_us:
+                if (cur_arr_time -
+                        dat_extra[defaults.ARRIVAL_TIME_FET][arr_time_idx] >
+                        dur_us):
                     # This packet is the first packet that is too far
                     # in the past, so we will start the window on the
                     # next packet.
@@ -285,8 +276,8 @@ class BinaryModelWrapper(PytorchModelWrapper):
                 ("Problem finding beginning of window! Are there insufficient "
                  "packets?")
             self.__bucketize(
-                dat_in, win_start_idx, pkt_idx, dat_in_new, win_idx, dur_us,
-                self.win)
+                dat_in, dat_extra, win_start_idx, pkt_idx, dat_in_new, win_idx,
+                dur_us, self.win)
 
         # Verify that we selected at least as many windows as we intended to.
         num_selected_wins = len(dat_in_new)
@@ -299,8 +290,7 @@ class BinaryModelWrapper(PytorchModelWrapper):
             # value. I.e., the final ground truth value for this window
             # becomes the ground truth for the entire window.
             np.take(dat_out, pkt_idxs),
-            np.take(dat_out_raw, pkt_idxs),
-            np.take(dat_out_oracle, pkt_idxs),
+            np.take(dat_extra, pkt_idxs),
             # The buckets all share a scaling group. Each other
             # feature is part of its own group.
             [0] * self.win +
@@ -352,22 +342,21 @@ class BinaryModelWrapper(PytorchModelWrapper):
         # becomes the ground truth for the entire window.
         return dat_in_new, np.take(dat_out, pkt_idxs), scl_grps
 
-    def modify_data(self, sim, dat_in, dat_out, dat_out_raw, dat_out_oracle,
-                    sequential):
+    def modify_data(self, sim, dat_in, dat_out, dat_extra, sequential):
         """
         Extracts from the set of simulations many separate intervals. Each
         interval becomes a training example.
         """
-        dat_in, dat_out, dat_out_raw, dat_out_oracle, scl_grps = (
+        dat_in, dat_out, dat_extra, scl_grps = (
             self.__create_buckets(
-                sim, dat_in, dat_out, dat_out_raw, dat_out_oracle, sequential)
+                sim, dat_in, dat_out, dat_extra, sequential)
             if self.rtt_buckets else (
                 self.__create_windows(dat_in, dat_out, sequential)
                 if self.windows else (
-                    dat_in, dat_out, dat_out_raw, dat_out_oracle,
+                    dat_in, dat_out, dat_extra,
                     # Each feature is part of its own scaling group.
                     list(range(len(dat_in.dtype.names))))))
-        return dat_in, dat_out, dat_out_raw, dat_out_oracle, scl_grps
+        return dat_in, dat_out, dat_extra, scl_grps
 
 
 class BinaryDnnWrapper(BinaryModelWrapper):
@@ -432,17 +421,17 @@ class SvmWrapper(BinaryModelWrapper):
         self.net = Svm(self.num_ins)
         return self.net
 
-    def modify_data(self, sim, dat_in, dat_out, dat_out_raw, dat_out_oracle,
-                    sequential):
-        dat_in, dat_out, dat_out_raw, dat_out_oracle, scl_grps = (
+    def modify_data(self, sim, dat_in, dat_out, dat_extra, sequential):
+        dat_in, dat_out, dat_extra, scl_grps = (
             super(SvmWrapper, self).modify_data(
-                sim, dat_in, dat_out, dat_out_raw, dat_out_oracle, sequential))
+                sim, dat_in, dat_out, dat_extra, sequential))
         # Map [0,1] to [-1, 1]
         # fet = dat_out.dtype.names[0]
         # dat_out[fet] = dat_out[fet] * 2 - 1
-        return dat_in, dat_out, dat_out_raw, dat_out_oracle, scl_grps
+        return dat_in, dat_out, dat_extra, scl_grps
 
     def _check_output_helper(self, out):
+        utils.assert_tensor(out=out)
         # Remove a trailing dimension of size 1.
         out = torch.reshape(out, (out.size()[0],))
         # Transform the output to report classes -1 and 1.
@@ -809,8 +798,9 @@ class SvmSklearnWrapper(SvmWrapper):
         """
         Returns the accuracy of predictions compared to ground truth
         labels. If self.graph == True, then this function also graphs
-        the accuracy.
+        the accuracy. preds, labels, raw, and fair must be Torch tensors.
         """
+        utils.assert_tensor(preds=preds, labels=labels, raw=raw, fair=fair)
         # Compute the distance from fair, then divide by fair to
         # compute the relative unfairness.
         diffs = (raw - fair) / fair
@@ -869,45 +859,138 @@ class SvmSklearnWrapper(SvmWrapper):
         return acc
 
 
-    def __plot_queue_occ(self, preds, labels, raw, fair, flp, x_lim=None):
-        """ Plots the queue occupancy and accuracy over time. """
-        print("Plotting queue occupancy...")
-        raw = raw.tolist()
-        fair = fair.tolist()
+    def __evaluate_sliding_window(self, preds, raw, fair, arr_times,
+                                  rtt_estimates_us):
+        """
+        Returns the sliding window accuracy of predictions based
+        on the rtt estimate and the window size. all arguments must be Torch
+        tensors.
 
-        # Convert labels from -1 and 1 to 0 and 1
-        # labels = (labels + 1) / 2
-        labels = labels.tolist()
+        preds: Prediction produced by the model
+        raw: Raw values of the queue occupancy
+        fair: Fair share of the flow
+        arr_times: The arrival times of each sample.
+        rtt_estimates_us: Rtt estimates computed on the receiver side
+        """
+        utils.assert_tensor(
+            preds=preds, raw=raw, fair=fair, arr_times=arr_times,
+            rtt_estimates_us=rtt_estimates_us)
+        num_pkts = len(raw)
+        assert len(preds) == num_pkts
+        assert len(fair) == num_pkts
+        assert len(arr_times) == num_pkts
+        assert len(rtt_estimates_us) == num_pkts
 
-        # Bucketize and compute bucket accuracies.
-        num_samples = preds.size()[0]
-        num_buckets = min(20 * 4, num_samples)
-        num_per_bucket = math.floor(num_samples / num_buckets)
-        assert num_per_bucket > 0, \
+        # Compute sliding window accuracy based on arrival time and RTT
+        sliding_window_accuracy = [0] * num_pkts
+        window_head = 0
+        max_packet = 0
+        for i in range(num_pkts):
+            recv_time = arr_times[i]
+            window_size_us = SLIDING_WINDOW_NUM_RTT * rtt_estimates_us[i]
+            while (window_head < num_pkts and
+                   recv_time - arr_times[window_head] >= window_size_us):
+                window_head += 1
+
+            max_packet = max(max_packet, i - window_head)
+            queue_occupancy = torch.mean(raw[window_head:i + 1])
+            label = torch.mean(preds[window_head:i + 1].type(torch.float))
+            sliding_window_accuracy[i] = (
+                int(label >= SMOOTHING_THRESHOLD)
+                if queue_occupancy > fair[i] else
+                int(label < SMOOTHING_THRESHOLD))
+        return sum(sliding_window_accuracy) / len(sliding_window_accuracy)
+
+    def __plot_throughput(self, labels, preds, fair, flp, btk_throughput,
+                          throughput_ewma, x_lim=None):
+        """
+        Plots the fair flow's throughput over time.
+
+        labels: Ground truth labels.
+        preds: Prediction produced by the model
+        fair: Fair share of the flow
+        flp: File name of the saved graph.
+        btk_throughput: Throughput of the bottleneck link
+        throughput_ewma: Throughput ewma computed in parse_dumbbell
+        x_lim: Graph limit on the x axis."""
+
+        fair = fair * btk_throughput
+        throughput_ewma = throughput_ewma * 1380 * 8 / 1000000
+
+        if self.graph:
+            # Bucketize and compute bucket accuracies.
+            num_samples = len(labels)
+            num_buckets = min(20 * 4, num_samples)
+            num_per_bucket = math.floor(num_samples / num_buckets)
+
+            assert num_per_bucket > 0, \
             ("There must be at least one sample per bucket, but there are "
              f"{num_samples} samples and only {num_buckets} buckets!")
-        buckets = [
-            (mean(queue_occupancy_),
-             mean(labels_))
-            for queue_occupancy_, labels_ in [
-                (raw[i:i + num_per_bucket],
-                 labels[i:i + num_per_bucket])
-                for i in range(0, num_samples, num_per_bucket)]]
+
+            buckets = [
+                (torch.mean(throughput_),
+                 torch.mean(fair_),
+                 self.check_output(preds_, labels_) / num_per_bucket,
+                 )
+                for throughput_, fair_, preds_, labels_, in [
+                    (throughput_ewma[i:i + num_per_bucket],
+                     fair[i:i + num_per_bucket],
+                     preds[i:i + num_per_bucket],
+                     labels[i:i + num_per_bucket]
+                     )
+                    for i in range(0, num_samples, num_per_bucket)]]
+
+            throughput_list, fair_list, accuracy_list = zip(*buckets)
+
+            x_axis = list(range(len(buckets)))
+
+            fig, ax1 = pyplot.subplots()
+            ax1.set_xlabel("Time")
+            ax1.set_ylabel("Throughput")
+            ax1.plot(x_axis, throughput_list, "b-")
+            ax1.plot(x_axis, fair_list, "g--")
+
+            ax2 = ax1.twinx()
+
+            ax2.set_ylabel("Accuracy")
+            ax2.plot(x_axis, accuracy_list, "r-")
+
+            if x_lim is not None:
+                pyplot.xlim(x_lim)
+            fig.tight_layout()
+            pyplot.savefig(flp)
+            pyplot.close()
+
+
+    def __plot_queue_occ(self, raw, fair, flp, x_lim=None):
+        """
+        Plots the queue occupancy over time. labels, raw, and fair must be
+        Torch tensors.
+
+        raw: Raw values of the queue occupancy
+        fair: Fair share of the flow
+        flp: File name of the saved graph.
+        x_lim: Graph limit on the x axis."""
+
         if self.graph:
-            queue_occupancy_list = [
-                queue_occupancy for queue_occupancy, _ in buckets]
-            fair_list = [fair] * len(buckets)
+            # Bucketize and compute bucket accuracies.
+            num_samples = len(raw.tolist())
+            num_buckets = min(20 * 4, num_samples)
+            num_per_bucket = math.floor(num_samples / num_buckets)
+
+            assert num_per_bucket > 0, \
+            ("There must be at least one sample per bucket, but there are "
+             f"{num_samples} samples and only {num_buckets} buckets!")
+
+            buckets = [
+                (torch.mean(raw[i:i + num_per_bucket]),
+                 torch.mean(fair[i:i + num_per_bucket]))
+                for i in range(0, num_samples, num_per_bucket)]
+            queue_occupancy_list, fair_list = zip(*buckets)
             x_axis = list(range(len(buckets)))
             pyplot.plot(x_axis, queue_occupancy_list, "b-")
             pyplot.plot(x_axis, fair_list, "g--")
-            label_accuracy = [0] * len(buckets)
-            bucketized_label = [0] * len(buckets)
-            label_accuracy, bucketized_label = zip(
-                *(((label, int(label >= SMOOTHING_THRESHOLD))
-                   if queue_occupancy > fair[0] else
-                   (1.0 - label, int(label < SMOOTHING_THRESHOLD)))
-                  for queue_occupancy, label in buckets))
-            pyplot.plot(x_axis, label_accuracy, "r^")
+
             if x_lim is not None:
                 pyplot.xlim(x_lim)
             pyplot.xlabel("Time")
@@ -916,29 +999,23 @@ class SvmSklearnWrapper(SvmWrapper):
             pyplot.savefig(flp)
             pyplot.close()
 
-            return sum(bucketized_label) / len(bucketized_label)
-        return 0
 
-
-    def test(self, fets, dat_in, dat_out_classes, dat_out_raw, dat_out_oracle,
-             num_flws, arr_times=None,
+    def test(self, fets, dat_in, dat_out_classes, dat_extra,
              graph_prms=copy.copy({
                  "out_dir": ".", "sort_by_unfairness": True, "dur_s": None})):
         """
         Tests this model on the provided dataset and returns the test accuracy
         (higher is better). Also, analyzes the model's feature coefficients and
-        (if self.graph == True) visualizes various metrics.
+        (if self.graph == True) visualizes various metrics. dat_in and
+        dat_out_classes must be Torch tensors. dat_extra must be a Numpy array.
 
         fets: List of feature names.
         dat_in: Test data.
         dat_out_classes: Ground truth labels.
-        dat_out_raw: Raw values used to compute dat_out_classes.
-        dat_out_oracle: Labels predicted by the Mathis model.
-        num_flws: The number of flows in the simulation that generated each
-            sample.
-        arr_times: The arrival times of each sample.
+        dat_extra: Extra data for each sample.
         graph_prms: Graphing parameters. Used only if self.graph == True.
         """
+        utils.assert_tensor(dat_in=dat_in, dat_out_classes=dat_out_classes)
         sort_by_unfairness = graph_prms["sort_by_unfairness"]
         dur_s = graph_prms["dur_s"]
         assert sort_by_unfairness or dur_s is not None, \
@@ -947,11 +1024,11 @@ class SvmSklearnWrapper(SvmWrapper):
 
         # Compute the fair share. Convert from int to float to avoid
         # all values being rounded to 0.
-        fair = torch.reciprocal(num_flws.type(torch.float))
+        fair = np.reciprocal(dat_extra["num_flws"].astype(float))
         # Calculate the x limits. Determine the maximum unfairness.
         x_lim = (
             # Compute the maximum unfairness.
-            (-1, ((dat_out_raw - fair) / fair).max().item())
+            (-1, ((dat_extra["raw"] - fair) / fair).max().item())
             if sort_by_unfairness else (0, graph_prms["dur_s"]))
         # Optionally create the output directory.
         out_dir = path.join(graph_prms["out_dir"], self.name)
@@ -1010,13 +1087,15 @@ class SvmSklearnWrapper(SvmWrapper):
         if self.graph:
             # Analyze, for each number of flows, accuracy vs. unfairness.
             flws_accs = []
-            nums_flws = list(set(num_flws.tolist()))
+            nums_flws = list(set(dat_extra["num_flws"].tolist()))
             for num_flws_selected in nums_flws:
                 print(f"Evaluating model for {num_flws_selected} flows:")
-                valid = torch.where(num_flws == num_flws_selected)
+                valid = np.where(dat_extra["num_flws"] == num_flws_selected)
                 flws_accs.append(self.__evaluate(
                     torch.tensor(self.net.predict(dat_in[valid])),
-                    dat_out_classes[valid], dat_out_raw[valid], fair[valid],
+                    dat_out_classes[valid],
+                    torch.tensor(dat_extra["raw"][valid]),
+                    torch.tensor(fair[valid]),
                     sort_by_unfairness,
                     graph_prms={
                         "flp": path.join(
@@ -1038,34 +1117,55 @@ class SvmSklearnWrapper(SvmWrapper):
             pyplot.close()
 
             # Plot queue occupancy.
-            bucketized_accuracy = self.__plot_queue_occ(
-                dat_out_oracle, dat_out_classes, dat_out_raw, fair,
+            self.__plot_queue_occ(
+                torch.tensor(dat_extra["raw"]),
+                torch.tensor(fair),
                 path.join(
                     out_dir, f"queue_occ_vs_fair_queue_occ_{self.name}.pdf"),
                 x_lim)
-        else:
-            bucketized_accuracy = float("NaN")
+
+            # Plot throughput
+            self.__plot_throughput(dat_out_classes,
+                    torch.tensor(self.net.predict(dat_in)),
+                    torch.tensor(fair), path.join(
+                    out_dir, f"throughput_{self.name}.pdf"),
+                    dat_extra["btk_throughput"],
+                    torch.tensor(dat_extra[defaults.THR_ESTIMATE_FET].copy()),
+                    x_lim=None)
 
         # Analyze accuracy vs. unfairness for all flows and all
-        # degrees of unfairness, for the Mathis Model oracle.
+        # degrees of unfairness, for the Mathis Model.
         print("Evaluting Mathis Model:")
+        raw = dat_extra["raw"].copy()
         self.__evaluate(
-            dat_out_oracle, dat_out_classes, dat_out_raw, fair,
+            torch.tensor(dat_extra[defaults.MATHIS_MODEL_FET].copy()),
+            dat_out_classes, torch.tensor(raw), torch.tensor(fair),
             sort_by_unfairness,
             graph_prms={
                 "flp": path.join(
                     out_dir, "accuracy_vs_unfairness_mathis.pdf"),
                 "x_lim": x_lim})
+
+        predictions = torch.tensor(self.net.predict(dat_in))
+
         # Analyze accuracy vs unfairness for all flows and all degrees
         # of unfairness, for the model itself.
         print(f"Evaluating {self.name} model:")
-        return self.__evaluate(
-            torch.tensor(self.net.predict(dat_in)), dat_out_classes,
-            dat_out_raw, fair, sort_by_unfairness,
+        model_acc = self.__evaluate(
+            predictions, dat_out_classes, torch.tensor(raw), torch.tensor(fair),
+            sort_by_unfairness,
             graph_prms={
                 "flp": path.join(
                     out_dir, f"accuracy_vs_unfairness_{self.name}.pdf"),
-                "x_lim": x_lim}), bucketized_accuracy
+                "x_lim": x_lim})
+
+        # Analyze accuracy of a sliding window method
+        sliding_window_accuracy = self.__evaluate_sliding_window(
+            predictions, torch.tensor(raw), torch.tensor(fair),
+            torch.tensor(dat_extra[defaults.ARRIVAL_TIME_FET].copy()),
+            torch.tensor(dat_extra[defaults.RTT_ESTIMATE_FET].copy()))
+
+        return model_acc, sliding_window_accuracy
 
 
 class LrSklearnWrapper(SvmSklearnWrapper):

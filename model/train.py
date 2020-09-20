@@ -143,12 +143,31 @@ def process_sim(idx, total, net, sim_flp, tmp_dir, warmup_prc, keep_prc,
     # Split each data matrix into two separate matrices: one with the input
     # features only and one with the output features only. The names of the
     # columns correspond to the feature names in in_spc and out_spc.
-    assert net.in_spc, "{sim_flp}: Empty in spec."
-    assert net.out_spc, "{sim_flp}: Empty out spec."
+    assert net.in_spc, f"{net.name}: Empty in spec."
+    num_out_fets = len(net.out_spc)
+    # This is not a strict requirement from a modeling point of view,
+    # but is assumed to make data processing easier.
+    assert num_out_fets == 1, \
+        (f"{net.name}: Out spec must contain a single feature, but actually "
+         f"contains: {net.out_spc}")
     dat_in = recfunctions.repack_fields(dat[net.in_spc])
     dat_out = recfunctions.repack_fields(dat[net.out_spc])
+    # Create a structured array to hold extra data that will not be
+    # used as features but may be needed by the training/testing
+    # process.
+    raw_dtype = [typ for typ in dat.dtype.descr if typ[0] in net.out_spc][0][1]
+    dtype = ([("raw", raw_dtype), ("num_flws", "int32"),
+              ("btk_throughput", "int32")] +
+             [typ for typ in dat.dtype.descr if typ[0] in defaults.EXTRA_FETS])
+    dat_extra = np.empty(shape=dat.shape, dtype=dtype)
+    dat_extra["raw"] = dat_out
+    dat_extra["num_flws"].fill(sim.unfair_flws + sim.fair_flws)
+    dat_extra["btk_throughput"].fill(sim.bw_Mbps)
+    for typ in defaults.EXTRA_FETS:
+        dat_extra[typ] = dat[typ]
+    dat_extra = recfunctions.repack_fields(dat_extra)
+
     # Convert output features to class labels.
-    dat_out_raw = dat_out
     dat_out = net.convert_to_class(sim, dat_out)
 
     # If the results contains NaNs or Infs, then discard this
@@ -174,27 +193,23 @@ def process_sim(idx, total, net, sim_flp, tmp_dir, warmup_prc, keep_prc,
         assert 0 <= cls < net.num_clss, f"Invalid class: {cls}"
 
     # Transform the data as required by this specific model.
-    dat_in, dat_out, dat_out_raw, dat_out_oracle, scl_grps = net.modify_data(
-        sim, dat_in, dat_out, dat_out_raw,
-        # Must put the column name in a list for the result to be
-        # a structured array.
-        dat_out_oracle=dat[["mathis model label-ewma-alpha0.01"]],
-        sequential=sequential)
+    dat_in, dat_out, dat_extra, scl_grps = net.modify_data(
+        sim, dat_in, dat_out, dat_extra, sequential=sequential)
 
     # Select a fraction of the data.
-    num_rows = dat_in.shape[0]
-    num_to_pick = math.ceil(num_rows * keep_prc / 100)
-    idxs = np.random.random_integers(0, num_rows - 1, num_to_pick)
-    dat_in = dat_in[idxs]
-    dat_out = dat_out[idxs]
-    dat_out_raw = dat_out_raw[idxs]
-    dat_out_oracle = dat_out_oracle[idxs]
+    if keep_prc != 100:
+        num_rows = dat_in.shape[0]
+        num_to_pick = math.ceil(num_rows * keep_prc / 100)
+        idxs = np.random.random_integers(0, num_rows - 1, num_to_pick)
+        dat_in = dat_in[idxs]
+        dat_out = dat_out[idxs]
+        dat_extra = dat_extra[idxs]
 
     # To avoid errors with sending large matrices between processes,
     # store the results in a temporary file.
     dat_flp = path.join(tmp_dir, f"{path.basename(sim_flp)[:-4]}_tmp.npz")
     utils.save_tmp_file(
-        dat_flp, dat_in, dat_out, dat_out_raw, dat_out_oracle, scl_grps)
+        dat_flp, dat_in, dat_out, dat_extra, scl_grps)
     return dat_flp, sim
 
 
@@ -266,52 +281,58 @@ def make_datasets(net, args, dat=None):
     dtype_in = None
     dim_out = None
     dtype_out = None
+    dim_extra = None
+    dtype_extra = None
     scl_grps = None
-    for dat_in, dat_out, _, _, scl_grps_cur in dat_all:
+    for dat_in, dat_out, dat_extra, scl_grps_cur in dat_all:
         dim_in_cur = len(dat_in.dtype.names)
         dim_out_cur = len(dat_out.dtype.names)
+        dim_extra_cur = len(dat_extra.dtype.names)
         dtype_in_cur = dat_in.dtype
         dtype_out_cur = dat_out.dtype
+        dtype_extra_cur = dat_extra.dtype
         if dim_in is None:
             dim_in = dim_in_cur
         if dim_out is None:
             dim_out = dim_out_cur
+        if dim_extra is None:
+            dim_extra = dim_extra_cur
         if dtype_in is None:
             dtype_in = dtype_in_cur
         if dtype_out is None:
             dtype_out = dtype_out_cur
+        if dtype_extra is None:
+            dtype_extra = dtype_extra_cur
         if scl_grps is None:
             scl_grps = scl_grps_cur
         assert dim_in_cur == dim_in, \
             f"Invalid input feature dim: {dim_in_cur} != {dim_in}"
         assert dim_out_cur == dim_out, \
             f"Invalid output feature dim: {dim_out_cur} != {dim_out}"
+        assert dim_extra_cur == dim_extra, \
+            f"Invalid extra data dim: {dim_extra_cur} != {dim_extra}"
         assert dtype_in_cur == dtype_in, \
             f"Invalud input dtype: {dtype_in_cur} != {dtype_in}"
         assert dtype_out_cur == dtype_out, \
             f"Invalid output dtype: {dtype_out_cur} != {dtype_out}"
+        assert dtype_extra_cur == dtype_extra, \
+            f"Invalid extra data dtype: {dtype_extra_cur} != {dtype_extra}"
         assert (scl_grps_cur == scl_grps).all(), \
             f"Invalid scaling groups: {scl_grps_cur} != {scl_grps}"
     assert dim_in is not None, "Unable to compute input feature dim!"
     assert dim_out is not None, "Unable to compute output feature dim!"
+    assert dim_extra is not None, "Unable to compute extra data dim!"
     assert dtype_in is not None, "Unable to compute input dtype!"
     assert dtype_out is not None, "Unable to compute output dtype!"
+    assert dtype_extra is not None, "Unable to compute extra data dtype!"
     assert scl_grps is not None, "Unable to compte scaling groups!"
 
     # Build combined feature lists.
-    dat_in_all, dat_out_all, dat_out_all_raw, dat_out_all_oracle, _ = zip(
-        *dat_all)
-    # Determine the number of flows in each example.
-    num_flws = [sim.unfair_flws + sim.fair_flws for sim in sims]
-    num_flws = [
-        np.array([num_flws_] * dat_in.shape[0], dtype=[("num_flws", "int")])
-        for num_flws_, dat_in in zip(num_flws, dat_in_all)]
-    num_flws = np.concatenate(num_flws, axis=0)
+    dat_in_all, dat_out_all, dat_extra_all, _ = zip(*dat_all)
     # Stack the arrays.
     dat_in_all = np.concatenate(dat_in_all, axis=0)
     dat_out_all = np.concatenate(dat_out_all, axis=0)
-    dat_out_all_raw = np.concatenate(dat_out_all_raw, axis=0)
-    dat_out_all_oracle = np.concatenate(dat_out_all_oracle, axis=0)
+    dat_extra_all = np.concatenate(dat_extra_all, axis=0)
 
     # Convert all instances of -1 (feature value unknown) to the mean
     # for that feature.
@@ -343,61 +364,64 @@ def make_datasets(net, args, dat=None):
     #         print(f"Discarding: {fet}")
     # dat_in_all = dat_in_all[fets]
 
-    return (
-        dat_in_all, dat_out_all, dat_out_all_raw, dat_out_all_oracle, num_flws,
-        prms_in)
+    return dat_in_all, dat_out_all, dat_extra_all, prms_in
 
 
 def gen_data(net, args, dat_flp, scl_prms_flp, dat=None, save_data=True):
     """ Generates training data and optionally saves it. """
-    dat_in, dat_out, dat_out_raw, dat_out_oracle, num_flws, scl_prms = (
-        make_datasets(net, args, dat))
+    dat_in, dat_out, dat_extra, scl_prms = make_datasets(net, args, dat)
     # Save the processed data so that we do not need to process it again.
     if save_data:
-        utils.save(
-            dat_flp, dat_in, dat_out, dat_out_raw, dat_out_oracle, num_flws)
+        utils.save(dat_flp, dat_in, dat_out, dat_extra)
     # Save scaling parameters.
     print(f"Saving scaling parameters: {scl_prms_flp}")
     with open(scl_prms_flp, "w") as fil:
         json.dump(scl_prms.tolist(), fil)
-    return dat_in, dat_out, dat_out_raw, dat_out_oracle, num_flws
+    return dat_in, dat_out, dat_extra
 
 
-def split_data(net, dat_in, dat_out, dat_out_raw, dat_out_oracle, num_flws,
-               bch_trn, bch_tst, use_val=False):
+def split_data(net, dat_in, dat_out, dat_extra, bch_trn, bch_tst,
+               use_val=False):
     """
     Divides the input and output data into training, validation, and
     testing sets and constructs data loaders.
     """
     print("Creating train/val/test data...")
-    #assert len(dat_out.shape) == 1
-    #assert len(dat_out_raw.shape) == 1
-    #assert len(dat_out_oracle.shape) == 1
-    #assert len(num_flws.shape) == 1
 
     fets = dat_in.dtype.names
+    # Keep track of the dtype of dat_extra so that we can recreate it
+    # as a structured array.
+    extra_dtype = dat_extra.dtype.descr
     # Destroy columns names to make merging the matrices easier. I.e.,
     # convert from structured to regular numpy arrays.
     dat_in = utils.clean(dat_in)
     dat_out = utils.clean(dat_out)
-    dat_out_raw = utils.clean(dat_out_raw)
-    dat_out_oracle = utils.clean(dat_out_oracle)
-    num_flws = utils.clean(num_flws)
+    dat_extra = utils.clean(dat_extra)
     # Shuffle the data to ensure that the training, validation, and
     # test sets are uniformly sampled. To shuffle all of the arrays
     # together, we must first merge them into a combined matrix.
     num_cols_in = dat_in.shape[1]
     merged = np.concatenate(
-        (dat_in, dat_out, dat_out_raw, dat_out_oracle, num_flws), axis=1)
+        (dat_in, dat_out, dat_extra), axis=1)
     np.random.shuffle(merged)
     dat_in = merged[:, :num_cols_in]
     dat_out = merged[:, num_cols_in]
-    dat_out_raw = merged[:, num_cols_in + 1]
-    dat_out_oracle = merged[:, num_cols_in + 2]
-    num_flws = merged[:, num_cols_in + 3]
+    # Rebuilding dat_extra is more complicated because we need it to
+    # be a structed array (for ease of use).
+    num_exps = dat_in.shape[0]
+    dat_extra = np.empty((num_exps,), dtype=extra_dtype)
+    num_cols = merged.shape[1]
+    num_cols_extra = num_cols - (num_cols_in + 1)
+    extra_names = dat_extra.dtype.names
+    num_cols_extra_expected = len(extra_names)
+    assert num_cols_extra == num_cols_extra_expected, \
+        (f"Error while reassembling \"dat_extra\". {num_cols_extra} columns "
+         f"does not match {num_cols_extra_expected} expected columns: "
+         f"{extra_names}")
+    for name, merged_idx in zip(extra_names, range(num_cols_in + 1, num_cols)):
+        dat_extra[name] = merged[:, merged_idx]
 
     # 50% for training, 20% for validation, 30% for testing.
-    num_exps = dat_in.shape[0]
     num_val = int(round(num_exps * 0.2)) if use_val else 0
     num_tst = int(round(num_exps * 0.3))
     print((f"    Data - train: {num_exps - num_val - num_tst}, val: {num_val}, "
@@ -405,18 +429,18 @@ def split_data(net, dat_in, dat_out, dat_out_raw, dat_out_oracle, num_flws,
     # Validation.
     dat_val_in = dat_in[:num_val]
     dat_val_out = dat_out[:num_val]
+    dat_val_extra = dat_extra[:num_val]
     # Testing.
     dat_tst_in = dat_in[num_val:num_val + num_tst]
     dat_tst_out = dat_out[num_val:num_val + num_tst]
-    dat_tst_out_raw = dat_out_raw[num_val:num_val + num_tst]
-    dat_tst_out_oracle = dat_out_oracle[num_val:num_val + num_tst]
-    num_flws_tst = num_flws[num_val:num_val + num_tst]
+    dat_tst_extra = dat_extra[num_val:num_val + num_tst]
     # Training.
     dat_trn_in = dat_in[num_val + num_tst:]
     dat_trn_out = dat_out[num_val + num_tst:]
+    dat_trn_extra = dat_extra[num_val + num_tst:]
 
     # Create the dataloaders.
-    dataset_trn = utils.Dataset(fets, dat_trn_in, dat_trn_out)
+    dataset_trn = utils.Dataset(fets, dat_trn_in, dat_trn_out, dat_trn_extra)
     ldr_trn = (
         torch.utils.data.DataLoader(
             dataset_trn, batch_size=bch_tst, shuffle=True, drop_last=False)
@@ -427,13 +451,11 @@ def split_data(net, dat_in, dat_out, dat_out_raw, dat_out_oracle, num_flws,
                 dataset_trn, bch_trn, drop_last=False)))
     ldr_val = (
         torch.utils.data.DataLoader(
-            utils.Dataset(fets, dat_val_in, dat_val_out), batch_size=bch_tst,
-            shuffle=False, drop_last=False)
+            utils.Dataset(fets, dat_val_in, dat_val_out, dat_val_extra),
+            batch_size=bch_tst, shuffle=False, drop_last=False)
         if use_val else None)
     ldr_tst = torch.utils.data.DataLoader(
-        utils.Dataset(
-            fets, dat_tst_in, dat_tst_out, dat_tst_out_raw, dat_tst_out_oracle,
-            num_flws_tst),
+        utils.Dataset(fets, dat_tst_in, dat_tst_out, dat_tst_extra),
         batch_size=bch_tst, shuffle=False, drop_last=False)
     return ldr_trn, ldr_val, ldr_tst
 
@@ -625,8 +647,7 @@ def test(net, ldr_tst, dev):
     return acc_tst
 
 
-def run_sklearn(args, dat_in, dat_out, dat_out_raw, dat_out_oracle, num_flws,
-                out_dir, out_flp):
+def run_sklearn(args, dat_in, dat_out, dat_extra, out_dir, out_flp):
     """
     Trains an sklearn model according to the supplied parameters. Returns the
     test error (lower is better).
@@ -637,8 +658,8 @@ def run_sklearn(args, dat_in, dat_out, dat_out_raw, dat_out_oracle, num_flws,
     net.new(**{param: args[param] for param in net.params})
     # Split the data into training, validation, and test loaders.
     ldr_trn, _, ldr_tst = split_data(
-        net, dat_in, dat_out, dat_out_raw, dat_out_oracle, num_flws,
-        args["train_batch"], args["test_batch"])
+        net, dat_in, dat_out, dat_extra, args["train_batch"],
+        args["test_batch"])
     # Training.
     print("Training...")
     tim_srt_s = time.time()
@@ -663,8 +684,7 @@ def run_sklearn(args, dat_in, dat_out, dat_out_raw, dat_out_oracle, num_flws,
     return acc_tst, tim_trn_s
 
 
-def run_torch(args, dat_in, dat_out, dat_out_raw, dat_out_oracle, num_flws,
-              out_dir, out_flp):
+def run_torch(args, dat_in, dat_out, dat_extra, out_dir, out_flp):
     """
     Trains a PyTorch model according to the supplied parameters. Returns the
     test error (lower is better).
@@ -681,8 +701,8 @@ def run_torch(args, dat_in, dat_out, dat_out_raw, dat_out_oracle, num_flws,
 
     # Split the data into training, validation, and test loaders.
     ldr_trn, ldr_val, ldr_tst = split_data(
-        net, dat_in, dat_out, dat_out_raw, dat_out_oracle, num_flws,
-        args["train_batch"], args["test_batch"])
+        net, dat_in, dat_out, dat_extra, args["train_batch"],
+        args["test_batch"])
 
     # Explicitly move the training (and maybe validation) data to the target
     # device.
@@ -766,7 +786,6 @@ def run_trials(args):
     if fets:
         net_tmp.in_spc = fets
     else:
-        assert "arrival time us" not in args["features"]
         args["features"] = net_tmp.in_spc
     # If a trained model file already exists, then delete it.
     if path.exists(out_flp):
@@ -781,16 +800,15 @@ def run_trials(args):
     if (not args["regen_data"] and path.exists(dat_flp) and
             path.exists(scl_prms_flp)):
         print("Found existing data!")
-        dat_in, dat_out, dat_out_raw, dat_out_oracle, num_flws = utils.load(
-            dat_flp)
+        dat_in, dat_out, dat_extra = utils.load(dat_flp)
         dat_in_shape = dat_in.shape
         dat_out_shape = dat_out.shape
         assert dat_in_shape[0] == dat_out_shape[0], \
             f"Data has invalid shapes! in: {dat_in_shape}, out: {dat_out_shape}"
     else:
         print("Regenerating data...")
-        dat_in, dat_out, dat_out_raw, dat_out_oracle, num_flws = (
-            gen_data(net_tmp, args, dat_flp, scl_prms_flp))
+        dat_in, dat_out, dat_extra = gen_data(
+            net_tmp, args, dat_flp, scl_prms_flp)
     print(f"Number of input features: {len(dat_in.dtype.names)}")
 
     # Visualaize the ground truth data.
@@ -806,9 +824,7 @@ def run_trials(args):
         res = (
             run_sklearn
             if isinstance(net_tmp, models.SvmSklearnWrapper)
-            else run_torch)(
-                args, dat_in, dat_out, dat_out_raw, dat_out_oracle, num_flws,
-                out_dir, out_flp)
+            else run_torch)(args, dat_in, dat_out, dat_extra, out_dir, out_flp)
         if res[0] == 100:
             print(
                 (f"Training failed (attempt {apts}/{apts_max}). Trying again!"))

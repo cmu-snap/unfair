@@ -26,20 +26,14 @@ LOCK_FLN = "lock"
 class Dataset(torch.utils.data.Dataset):
     """ A simple Dataset that wraps arrays of input and output features. """
 
-    def __init__(self, fets, dat_in, dat_out, dat_out_raw=None,
-                 dat_out_oracle=None, num_flws=None):
+    def __init__(self, fets, dat_in, dat_out, dat_extra):
         """
         fets: List of input feature names, corresponding to the columns of
             dat_in.
-        dat_in: Numpy array of input data, with two dimensions.
+        dat_in: Numpy array of input data.
         dat_out: Numpy array of output data. Assumed to have a single practical
             dimension only (e.g., dat_out should be of shape (X,), or (X, 1)).
-        dat_out_raw: Numpy array of raw features values used to create dat_out.
-            Same shape as dat_out.
-        dat_out_oracle: Numpy array of oracle predictions for this data. Same
-            shape as dat_out.
-        num_flws: Numpy array of the total number of flows in each datapoint's
-            experiment. Same shape as dat_out.
+        dat_extra: Numpy array of extra data.
         """
         super(Dataset).__init__()
         shp_in = dat_in.shape
@@ -50,6 +44,7 @@ class Dataset(torch.utils.data.Dataset):
         assert shp_in[1] == num_fets, \
             f"Mismatched dat_in ({shp_in}) and fets (len: {num_fets})"
 
+        self.fets = fets
         # Convert the numpy arrays to Torch tensors.
         self.dat_in = torch.tensor(dat_in, dtype=torch.float)
         # Reshape the output into a 1D array first, because
@@ -57,19 +52,9 @@ class Dataset(torch.utils.data.Dataset):
         # long because the loss functions expect longs.
         self.dat_out = torch.tensor(
             dat_out.reshape(shp_out[0]), dtype=torch.long)
-
-        self.fets = fets
-        self.dat_out_raw = (
-            None if dat_out_raw is None
-            else torch.tensor(
-                dat_out_raw.reshape(shp_out[0]), dtype=torch.float))
-        self.dat_out_oracle = (
-            None if dat_out_oracle is None
-            else torch.tensor(
-                dat_out_oracle.reshape(shp_out[0]), dtype=torch.int))
-        self.num_flws = (
-            None if num_flws is None
-            else torch.tensor(num_flws.reshape(shp_out[0]), dtype=torch.int))
+        # Do not convert dat_extra to a Torch tensor because it will
+        # not interact with models.
+        self.dat_extra = dat_extra
 
     def to(self, dev):
         """ Move the entire dataset to the target device. """
@@ -96,8 +81,7 @@ class Dataset(torch.utils.data.Dataset):
 
     def raw(self):
         """ Returns the raw data underlying this dataset. """
-        return (self.fets, self.dat_in, self.dat_out, self.dat_out_raw,
-                self.dat_out_oracle, self.num_flws)
+        return self.fets, self.dat_in, self.dat_out, self.dat_extra
 
 
 class BalancedSampler:
@@ -442,43 +426,42 @@ def safe_update_ewma(prev_ewma, new_val, alpha):
         alpha * new_val + (1 - alpha) * prev_ewma)
 
 
-def filt(dat_in, dat_out, dat_out_raw, dat_out_oracle, scl_grps, num_sims, prc):
+def filt(dat_in, dat_out, dat_extra, scl_grps, num_sims, prc):
     """
     Filters parsed data based on a desired number of simulations and percent of
-    results from each simulation. Each dat_* is a list where each entry is the
-    results of one simulation.
+    results from each simulation. Each dat_* is a Python list, where each entry
+    is a Numpy array containing the results of one simulation.
     """
     assert (
         len(dat_in) >= num_sims and
         len(dat_out) == len(dat_in) and
-        len(dat_out_raw) == len(dat_in) and
-        len(dat_out_oracle) == len(dat_in)), "Malformed arguments!"
+        len(dat_extra) == len(dat_in)), "Malformed arguments!"
 
+    # Pick the desired number of simulations.
     dat_in = dat_in[:num_sims]
     dat_out = dat_out[:num_sims]
-    dat_out_raw = dat_out_raw[:num_sims]
-    dat_out_oracle = dat_out_oracle[:num_sims]
+    dat_extra = dat_extra[:num_sims]
     scl_grps = scl_grps[:num_sims]
-    for idx in range(num_sims):
-        num_rows = dat_in[idx].shape[0]
-        num_to_pick = math.ceil(num_rows * prc / 100)
-        idxs = np.random.random_integers(0, num_rows - 1, num_to_pick)
-        dat_in[idx] = dat_in[idx][idxs]
-        dat_out[idx] = dat_out[idx][idxs]
-        dat_out_raw[idx] = dat_out_raw[idx][idxs]
-        dat_out_oracle[idx] = dat_out_oracle[idx][idxs]
-    return dat_in, dat_out, dat_out_raw, dat_out_oracle, scl_grps
+    # From each simulation, pick the desired fraction.
+    if prc != 100:
+        for idx in range(num_sims):
+            num_rows = dat_in[idx].shape[0]
+            idxs = np.random.random_integers(
+                0, num_rows - 1, math.ceil(num_rows * prc / 100))
+            dat_in[idx] = dat_in[idx][idxs]
+            dat_out[idx] = dat_out[idx][idxs]
+            dat_extra[idx] = dat_extra[idx][idxs]
+    return dat_in, dat_out, dat_extra, scl_grps
 
 
-def save(flp, dat_in, dat_out, dat_out_raw, dat_out_oracle, num_flws):
+def save(flp, dat_in, dat_out, dat_extra):
     """
     Saves parsed data. Each dat_* is a list where each entry is the results of
     one simulation.
     """
     print(f"Saving data: {flp}")
     np.savez_compressed(
-        flp, dat_in=dat_in, dat_out=dat_out, dat_out_raw=dat_out_raw,
-        dat_out_oracle=dat_out_oracle, num_flws=num_flws)
+        flp, dat_in=dat_in, dat_out=dat_out, dat_extra=dat_extra)
 
 
 def load(flp):
@@ -488,17 +471,15 @@ def load(flp):
     """
     print(f"Loading data: {flp}")
     with np.load(flp) as fil:
-        return (
-            fil["dat_in"], fil["dat_out"], fil["dat_out_raw"],
-            fil["dat_out_oracle"], fil["num_flws"])
+        return fil["dat_in"], fil["dat_out"], fil["dat_extra"]
 
 
-def save_tmp_file(flp, dat_in, dat_out, dat_out_raw, dat_out_oracle, scl_grps):
+def save_tmp_file(flp, dat_in, dat_out, dat_extra, scl_grps):
     """ Saves a single-simulation temporary results file. """
     print(f"Saving temporary data: {flp}")
     np.savez_compressed(
-        flp, dat_in=dat_in, dat_out=dat_out, dat_out_raw=dat_out_raw,
-        dat_out_oracle=dat_out_oracle, scl_grps=scl_grps)
+        flp, dat_in=dat_in, dat_out=dat_out, dat_extra=dat_extra,
+        scl_grps=scl_grps)
 
 
 def load_tmp_file(flp):
@@ -507,11 +488,10 @@ def load_tmp_file(flp):
     with np.load(flp) as fil:
         dat_in = fil["dat_in"]
         dat_out = fil["dat_out"]
-        dat_out_raw = fil["dat_out_raw"]
-        dat_out_oracle = fil["dat_out_oracle"]
+        dat_extra = fil["dat_extra"]
         scl_grps = fil["scl_grps"]
     os.remove(flp)
-    return dat_in, dat_out, dat_out_raw, dat_out_oracle, scl_grps
+    return dat_in, dat_out, dat_extra, scl_grps
 
 
 def get_lock_flp(out_dir):
@@ -566,3 +546,13 @@ def set_rand_seed(seed=SEED):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+
+def assert_tensor(**kwargs):
+    """
+    Asserts that the provided values (given as keyword args) are Torch tensors.
+    """
+    for name, val in kwargs.items():
+        assert isinstance(val, torch.Tensor), \
+        (f"\"{name}\" is of type \"{type(val)}\" when it should be of type "
+         "\"torch.Tensor\"")
