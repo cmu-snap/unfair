@@ -45,7 +45,7 @@ PyYAML==6.0
 requirements-detector==0.7
 scapy==2.5.0
 scikit-learn==1.0.1
-scipy==1.7.3
+scipy==1.11.1
 setoptconf-tmp==0.3.1
 six==1.16.0
 snowballstemmer==2.2.0
